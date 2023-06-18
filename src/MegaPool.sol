@@ -87,24 +87,22 @@ contract MegaPool {
     function _interpretOp(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
         uint256 mop = op & Ops.MASK_OP;
         if (mop == Ops.SWAP) {
-            ptr = _swap(state, ptr, op);
+            return _swap(state, ptr, op);
         } else if (mop == Ops.ADD_LIQ) {
-            ptr = _addLiquidity(state, ptr);
+            return _addLiquidity(state, ptr);
         } else if (mop == Ops.RM_LIQ) {
-            ptr = _removeLiquidity(state, ptr);
+            return _removeLiquidity(state, ptr);
         } else if (mop == Ops.SEND) {
-            ptr = _send(state, ptr);
+            return _send(state, ptr);
         } else if (mop == Ops.RECEIVE) {
-            ptr = _receive(state, ptr);
+            return _receive(state, ptr);
         } else if (mop == Ops.SWAP_HEAD) {
-            ptr = _swapHead(state, ptr, op);
+            return _swapHead(state, ptr, op);
         } else if (mop == Ops.SWAP_HOP) {
-            ptr = _swapHop(state, ptr, op);
+            return _swapHop(state, ptr, op);
         } else {
             revert InvalidOp(op);
         }
-
-        return ptr;
     }
 
     function _swap(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
@@ -240,7 +238,7 @@ contract MegaPool {
     }
 
     function _readUint(uint256 ptr, uint256 size) internal pure returns (uint256 newPtr, uint256 x) {
-        require(size >= 1 && size <= 32);
+        require(size > 0 && size < 33);
         assembly {
             newPtr := add(ptr, size)
             x := shr(shl(3, sub(32, size)), calldataload(ptr))
