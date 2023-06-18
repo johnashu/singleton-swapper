@@ -27,6 +27,8 @@ contract MegaPool {
     error LeftoverDelta();
     error InvalidGive();
     error NegativeAmount();
+    error NegativeReceive();
+    error AmountOutsideBounds();
 
     constructor(uint256 feeBps) {
         require(feeBps < BPS);
@@ -87,22 +89,30 @@ contract MegaPool {
     function _interpretOp(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
         uint256 mop = op & Ops.MASK_OP;
         if (mop == Ops.SWAP) {
-            return _swap(state, ptr, op);
+            ptr = _swap(state, ptr, op);
         } else if (mop == Ops.ADD_LIQ) {
-            return _addLiquidity(state, ptr);
+            ptr = _addLiquidity(state, ptr);
         } else if (mop == Ops.RM_LIQ) {
-            return _removeLiquidity(state, ptr);
+            ptr = _removeLiquidity(state, ptr);
         } else if (mop == Ops.SEND) {
-            return _send(state, ptr);
+            ptr = _send(state, ptr);
         } else if (mop == Ops.RECEIVE) {
-            return _receive(state, ptr);
+            ptr = _receive(state, ptr);
         } else if (mop == Ops.SWAP_HEAD) {
-            return _swapHead(state, ptr, op);
+            ptr = _swapHead(state, ptr, op);
         } else if (mop == Ops.SWAP_HOP) {
-            return _swapHop(state, ptr, op);
+            ptr = _swapHop(state, ptr);
+        } else if (mop == Ops.SEND_ALL) {
+            ptr = _sendAll(state, ptr, op);
+        } else if (mop == Ops.RECEIVE_ALL) {
+            ptr = _receiveAll(state, ptr, op);
+        } else if (mop == Ops.PULL_ALL) {
+            ptr = _pullAll(state, ptr, op);
         } else {
             revert InvalidOp(op);
         }
+
+        return ptr;
     }
 
     function _swap(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
@@ -181,15 +191,7 @@ contract MegaPool {
         (ptr, token) = _readAddress(ptr);
         (ptr, amount) = _readUint(ptr, 16);
 
-        if (IGiver(msg.sender).give(token, amount) != IGiver.give.selector) {
-            revert InvalidGive();
-        }
-        uint256 reserves = totalReservesOf[token];
-        uint256 directBalance = token.balanceOf(address(this));
-        uint256 totalReceived = directBalance - reserves;
-
-        state.tokenDeltas.accountChange(token, -totalReceived.toInt256());
-        totalReservesOf[token] = directBalance;
+        _receive(state, token, amount);
 
         return ptr;
     }
@@ -213,7 +215,7 @@ contract MegaPool {
         return ptr;
     }
 
-    function _swapHop(State memory state, uint256 ptr, uint256) internal returns (uint256) {
+    function _swapHop(State memory state, uint256 ptr) internal returns (uint256) {
         address lastToken = state.lastToken;
         address nextToken;
         (ptr, nextToken) = _readAddress(ptr);
@@ -231,6 +233,75 @@ contract MegaPool {
         return ptr;
     }
 
+    function _sendAll(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
+        address token;
+        address to;
+
+        (ptr, token) = _readAddress(ptr);
+        int256 delta = state.tokenDeltas.resetChange(token);
+        if (delta > 0) revert NegativeAmount();
+
+        uint256 minSend = 0;
+        uint256 maxSend = type(uint128).max;
+
+        if (op & Ops.ALL_MIN_BOUND != 0) (ptr, minSend) = _readUint(ptr, 16);
+        if (op & Ops.ALL_MAX_BOUND != 0) (ptr, maxSend) = _readUint(ptr, 16);
+
+        uint256 amount = uint256(-delta);
+        if (amount < minSend || amount > maxSend) revert AmountOutsideBounds();
+
+        (ptr, to) = _readAddress(ptr);
+        totalReservesOf[token] -= amount;
+        token.safeTransfer(to, amount);
+
+        return ptr;
+    }
+
+    function _receiveAll(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
+        address token;
+
+        (ptr, token) = _readAddress(ptr);
+
+        uint256 minReceive = 0;
+        uint256 maxReceive = type(uint128).max;
+
+        if (op & Ops.ALL_MIN_BOUND != 0) (ptr, minReceive) = _readUint(ptr, 16);
+        if (op & Ops.ALL_MAX_BOUND != 0) (ptr, maxReceive) = _readUint(ptr, 16);
+
+        int256 delta = state.tokenDeltas.getChange(token);
+        if (delta < 0) revert NegativeReceive();
+
+        uint256 amount = uint256(delta);
+        if (amount < minReceive || amount > maxReceive) revert AmountOutsideBounds();
+
+        _receive(state, token, amount);
+
+        return ptr;
+    }
+
+    function _pullAll(State memory state, uint256 ptr, uint256 op) internal returns (uint256) {
+        address token;
+
+        (ptr, token) = _readAddress(ptr);
+
+        uint256 minReceive = 0;
+        uint256 maxReceive = type(uint128).max;
+
+        if (op & Ops.ALL_MIN_BOUND != 0) (ptr, minReceive) = _readUint(ptr, 16);
+        if (op & Ops.ALL_MAX_BOUND != 0) (ptr, maxReceive) = _readUint(ptr, 16);
+
+        int256 delta = state.tokenDeltas.getChange(token);
+        if (delta < 0) revert NegativeReceive();
+
+        uint256 amount = uint256(delta);
+        if (amount < minReceive || amount > maxReceive) revert AmountOutsideBounds();
+
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        _accountReceived(state, token);
+
+        return ptr;
+    }
+
     function _readAddress(uint256 ptr) internal pure returns (uint256 newPtr, address addr) {
         uint256 rawVal;
         (newPtr, rawVal) = _readUint(ptr, 20);
@@ -238,7 +309,7 @@ contract MegaPool {
     }
 
     function _readUint(uint256 ptr, uint256 size) internal pure returns (uint256 newPtr, uint256 x) {
-        require(size > 0 && size < 33);
+        require(size >= 1 && size <= 32);
         assembly {
             newPtr := add(ptr, size)
             x := shr(shl(3, sub(32, size)), calldataload(ptr))
@@ -252,6 +323,22 @@ contract MegaPool {
         }
     }
 
+    function _receive(State memory state, address token, uint256 amount) internal {
+        if (IGiver(msg.sender).give(token, amount) != IGiver.give.selector) {
+            revert InvalidGive();
+        }
+        _accountReceived(state, token);
+    }
+
+    function _accountReceived(State memory state, address token) internal {
+        uint256 reserves = totalReservesOf[token];
+        uint256 directBalance = token.balanceOf(address(this));
+        uint256 totalReceived = directBalance - reserves;
+
+        state.tokenDeltas.accountChange(token, -totalReceived.toInt256());
+        totalReservesOf[token] = directBalance;
+    }
+
     function _getPool(address token0, address token1) internal pure returns (Pool storage pool) {
         if (token0 >= token1) revert InvalidTokens();
 
@@ -263,15 +350,5 @@ contract MegaPool {
             pool.slot := keccak256(0x00, 0x60)
             mstore(0x40, freeMem)
         }
-    }
-
-    function sign(int256 x) internal pure returns (string memory) {
-        if (x < 0) return "-";
-        if (x > 0) return "+";
-        return "";
-    }
-
-    function abs(int256 x) internal pure returns (uint256) {
-        return x < 0 ? uint256(-x) : uint256(x);
     }
 }
